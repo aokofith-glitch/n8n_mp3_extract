@@ -6,6 +6,17 @@ import tempfile
 from deep_translator import GoogleTranslator
 import time
 import re
+import requests
+from bs4 import BeautifulSoup
+try:
+    import wikipedia
+    wikipedia.set_lang("en")
+except:
+    pass
+try:
+    from duckduckgo_search import DDGS
+except:
+    pass
 
 # 페이지 설정
 st.set_page_config(
@@ -50,7 +61,7 @@ with st.sidebar:
 
 # 대시보드 스타일 정보 카드
 st.markdown("---")
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     st.markdown("### 🎬 YouTube URL")
@@ -67,6 +78,10 @@ with col3:
 with col4:
     st.markdown("### 🌐 번역")
     st.info("10개 이상 언어 지원")
+
+with col5:
+    st.markdown("### 📚 배경 정보")
+    st.info("사실 확인된 정보")
 
 st.markdown("---")
 
@@ -91,6 +106,7 @@ with how_to_col2:
     - ✅ **실시간 번역**: 10개 이상의 언어 지원
     - ✅ **줄별 비교**: 원본과 번역을 나란히 비교
     - ✅ **즉시 다운로드**: 추출된 MP3 파일 즉시 다운로드
+    - ✅ **배경 정보**: 노래 배경 스토리 및 가수 감정 정보 (사실 확인)
     """)
 
 st.markdown("---")
@@ -104,6 +120,10 @@ if 'translated_lyrics' not in st.session_state:
     st.session_state.translated_lyrics = None
 if 'original_language' not in st.session_state:
     st.session_state.original_language = None
+if 'video_info' not in st.session_state:
+    st.session_state.video_info = None
+if 'song_background' not in st.session_state:
+    st.session_state.song_background = None
 
 # 사이드바
 st.sidebar.header("⚙️ 설정")
@@ -328,16 +348,16 @@ def extract_lyrics(audio_path):
 def translate_text(text, target_lang):
     """텍스트를 목표 언어로 번역"""
     try:
-        # 원본 언어 자동 감지
-        detected_lang = GoogleTranslator().detect(text)
-        if detected_lang == target_lang:
-            return text, detected_lang
+        # 빈 텍스트 체크
+        if not text or not text.strip():
+            return text, "unknown"
         
+        # source='auto'로 자동 언어 감지 및 번역
         translator = GoogleTranslator(source='auto', target=target_lang)
         translated = translator.translate(text)
-        return translated, detected_lang
+        return translated, "auto"
     except Exception as e:
-        st.error(f"번역 중 오류 발생: {str(e)}")
+        # 오류 발생 시 원본 텍스트 반환
         return text, "unknown"
 
 def translate_line_by_line(lines, target_lang):
@@ -357,14 +377,272 @@ def translate_line_by_line(lines, target_lang):
     
     return translated_lines
 
+def extract_video_info(url):
+    """YouTube 비디오에서 메타데이터 추출 (제목, 아티스트, 설명 등)"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            video_info = {
+                'title': info.get('title', ''),
+                'uploader': info.get('uploader', ''),
+                'uploader_id': info.get('uploader_id', ''),
+                'description': info.get('description', ''),
+                'duration': info.get('duration', 0),
+                'view_count': info.get('view_count', 0),
+                'upload_date': info.get('upload_date', ''),
+            }
+            
+            # 아티스트 정보 추출 시도 (제목에서 추출)
+            title = video_info['title']
+            # 일반적인 패턴: "아티스트 - 제목" 또는 "제목 - 아티스트"
+            if ' - ' in title:
+                parts = title.split(' - ', 1)
+                if len(parts) == 2:
+                    video_info['possible_artist'] = parts[0].strip()
+                    video_info['possible_song_title'] = parts[1].strip()
+                else:
+                    video_info['possible_artist'] = ''
+                    video_info['possible_song_title'] = title
+            else:
+                video_info['possible_artist'] = video_info['uploader']
+                video_info['possible_song_title'] = title
+            
+            return video_info
+    except Exception as e:
+        st.warning(f"비디오 정보 추출 중 오류: {str(e)}")
+        return None
+
+def extract_release_year(video_info, search_text=""):
+    """발표 연도 추출"""
+    # YouTube 업로드 날짜에서 추출
+    if video_info and video_info.get('upload_date'):
+        upload_date = video_info['upload_date']
+        if len(upload_date) >= 4:
+            year = upload_date[:4]
+            try:
+                year_int = int(year)
+                if 1900 <= year_int <= 2100:
+                    return year
+            except:
+                pass
+    
+    # 검색 텍스트에서 연도 패턴 찾기
+    if search_text:
+        year_patterns = [
+            r'\b(19|20)\d{2}\b',  # 1900-2099
+            r'released in (\d{4})',
+            r'(\d{4}) release',
+            r'from (\d{4})',
+        ]
+        for pattern in year_patterns:
+            matches = re.findall(pattern, search_text, re.IGNORECASE)
+            if matches:
+                year = matches[0] if isinstance(matches[0], str) else matches[0]
+                if isinstance(year, tuple):
+                    year = year[0]
+                try:
+                    year_int = int(year)
+                    if 1900 <= year_int <= 2100:
+                        return str(year_int)
+                except:
+                    continue
+    
+    return ""
+
+def search_song_background(song_title, artist_name, video_info=None):
+    """노래 배경 정보 검색 (사실 확인된 정보) - 구조화된 형식"""
+    song_background = {
+        "title": song_title,
+        "artist": artist_name or "",
+        "release_year": "",
+        "context": {
+            "creation_intent": "",
+            "social_historical": "",
+            "musical_features": "",
+            "lyrics_meaning": "",
+            "artist_story": "",
+            "public_reception": "",
+            "influence": "",
+            "behind_the_scenes": ""
+        },
+        "sources": []
+    }
+    
+    all_collected_text = []  # 수집된 모든 텍스트를 저장
+    
+    search_queries = []
+    if artist_name and song_title:
+        search_queries.extend([
+            f"{artist_name} {song_title} song meaning background story",
+            f"{artist_name} {song_title} Wikipedia",
+            f"{artist_name} {song_title} interview",
+            f"{artist_name} {song_title} release year",
+            f"{artist_name} {song_title} chart performance",
+            f"{artist_name} {song_title} inspiration",
+            f"{artist_name} {song_title} behind the scenes"
+        ])
+    elif song_title:
+        search_queries.extend([
+            f"{song_title} song meaning background story",
+            f"{song_title} Wikipedia",
+            f"{song_title} release year"
+        ])
+    
+    # Wikipedia 검색 시도
+    try:
+        import wikipedia
+        # 노래 검색
+        search_query = f"{song_title} {artist_name}" if artist_name else song_title
+        try:
+            song_page = wikipedia.page(search_query, auto_suggest=True)
+            song_content = song_page.content
+            song_summary = song_page.summary
+            all_collected_text.append(song_content)
+            all_collected_text.append(song_summary)
+            
+            # 발표 연도 추출
+            if not song_background["release_year"]:
+                song_background["release_year"] = extract_release_year(video_info, song_content)
+            
+            song_background["sources"].append(f"Wikipedia: {song_page.url}")
+        except:
+            # 노래 제목만으로 검색
+            try:
+                song_page = wikipedia.page(song_title, auto_suggest=True)
+                song_content = song_page.content
+                song_summary = song_page.summary
+                all_collected_text.append(song_content)
+                all_collected_text.append(song_summary)
+                
+                if not song_background["release_year"]:
+                    song_background["release_year"] = extract_release_year(video_info, song_content)
+                
+                song_background["sources"].append(f"Wikipedia: {song_page.url}")
+            except:
+                pass
+    except ImportError:
+        pass
+    except Exception as e:
+        pass
+    
+    # DuckDuckGo 검색 시도
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            for query in search_queries[:5]:  # 더 많은 쿼리 사용
+                try:
+                    results = list(ddgs.text(query, max_results=3))
+                    for result in results:
+                        url = result.get('href', '')
+                        title = result.get('title', '')
+                        body = result.get('body', '')
+                        all_collected_text.append(body)
+                        
+                        # 신뢰할 수 있는 소스만 사용
+                        if any(domain in url.lower() for domain in ['wikipedia', 'genius.com', 'songfacts', 'allmusic', 'billboard', 'rollingstone', 'pitchfork']):
+                            if url not in song_background["sources"]:
+                                song_background["sources"].append(f"{title}: {url}")
+                except:
+                    continue
+    except ImportError:
+        pass
+    except Exception as e:
+        pass
+    
+    # 웹 스크래핑으로 추가 정보 수집 (Genius.com 등)
+    try:
+        if artist_name and song_title:
+            # Genius.com URL 생성 (여러 형식 시도)
+            artist_slug = artist_name.replace(' ', '-').lower().replace("'", "").replace(".", "")
+            song_slug = song_title.replace(' ', '-').lower().replace("'", "").replace(".", "")
+            genius_urls = [
+                f"https://genius.com/{artist_slug}-{song_slug}-lyrics",
+                f"https://genius.com/{artist_slug}-{song_slug}",
+            ]
+            
+            for genius_url in genius_urls:
+                try:
+                    response = requests.get(genius_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                        # 노트 섹션 찾기
+                        notes_section = soup.find('div', class_='rich_text_formatting')
+                        if notes_section:
+                            notes_text = notes_section.get_text(strip=True)
+                            all_collected_text.append(notes_text)
+                            song_background["sources"].append(f"Genius.com: {genius_url}")
+                            break
+                except:
+                    continue
+    except:
+        pass
+    
+    # 수집된 텍스트를 분석하여 각 context 필드에 맞게 분류
+    combined_text = " ".join(all_collected_text).lower()
+    
+    # 키워드 기반으로 정보 분류
+    keywords_mapping = {
+        "creation_intent": ["inspired", "inspiration", "wrote", "written", "composed", "created", "intent", "purpose", "motivation", "why"],
+        "social_historical": ["social", "historical", "era", "period", "time", "context", "background", "society", "culture", "political"],
+        "musical_features": ["genre", "instrument", "rhythm", "beat", "melody", "arrangement", "production", "sound", "style", "musical"],
+        "lyrics_meaning": ["lyrics", "meaning", "interpretation", "symbolism", "metaphor", "message", "theme", "lyric"],
+        "artist_story": ["artist", "singer", "message", "wanted", "trying", "story", "narrative", "tale"],
+        "public_reception": ["chart", "billboard", "popular", "success", "reception", "response", "reviews", "critics", "awards", "hit"],
+        "influence": ["influence", "impact", "legacy", "inspired", "influenced", "changed", "effect"],
+        "behind_the_scenes": ["recording", "studio", "music video", "mv", "performance", "live", "behind", "scenes", "making", "process"]
+    }
+    
+    # 각 필드에 대해 관련 정보 추출
+    for field, keywords in keywords_mapping.items():
+        relevant_sentences = []
+        for text_chunk in all_collected_text:
+            sentences = re.split(r'[.!?]\s+', text_chunk)
+            for sentence in sentences:
+                sentence_lower = sentence.lower()
+                if any(keyword in sentence_lower for keyword in keywords):
+                    # 관련 문장과 주변 문장 포함
+                    relevant_sentences.append(sentence.strip())
+        
+        if relevant_sentences:
+            # 중복 제거 및 길이 제한
+            unique_sentences = []
+            seen = set()
+            for sent in relevant_sentences:
+                sent_clean = sent[:200]  # 문장 길이 제한
+                if sent_clean not in seen and len(sent_clean) > 20:
+                    unique_sentences.append(sent)
+                    seen.add(sent_clean)
+            
+            song_background["context"][field] = ". ".join(unique_sentences[:5])  # 최대 5개 문장
+    
+    # 발표 연도가 아직 없으면 추출 시도
+    if not song_background["release_year"]:
+        song_background["release_year"] = extract_release_year(video_info, " ".join(all_collected_text))
+    
+    return song_background
+
 if extract_button and url:
     try:
         # 임시 디렉토리 생성
         temp_dir = tempfile.mkdtemp()
         output_path = os.path.join(temp_dir, "audio")
         
-        # 1. 오디오 다운로드
+        # 0. 비디오 정보 추출
         progress_bar = st.progress(0)
+        status_text.info("📋 YouTube 비디오 정보를 추출하는 중...")
+        progress_bar.progress(5)
+        
+        video_info = extract_video_info(url)
+        st.session_state.video_info = video_info
+        
+        # 1. 오디오 다운로드
         status_text.info("📥 YouTube에서 오디오를 다운로드하는 중...")
         progress_bar.progress(10)
         
@@ -404,6 +682,21 @@ if extract_button and url:
         st.session_state.lyrics = '\n'.join(lyrics_lines)  # 원본도 줄별로 정리
         
         status_text.success("✅ 번역 완료!")
+        progress_bar.progress(85)
+        
+        # 4. 노래 배경 정보 검색
+        if video_info:
+            status_text.info("🔍 노래 배경 정보를 검색하는 중... (사실 확인된 정보)")
+            progress_bar.progress(90)
+            
+            song_title = video_info.get('possible_song_title', video_info.get('title', ''))
+            artist_name = video_info.get('possible_artist', video_info.get('uploader', ''))
+            
+            background_info = search_song_background(song_title, artist_name, video_info)
+            st.session_state.song_background = background_info
+            
+            status_text.success("✅ 배경 정보 수집 완료!")
+        
         progress_bar.progress(100)
         
         time.sleep(0.5)
@@ -436,24 +729,99 @@ if st.session_state.lyrics:
     original_lines = [line.strip() for line in st.session_state.lyrics.split('\n') if line.strip()]
     translated_lines = [line.strip() for line in st.session_state.translated_lyrics.split('\n')] if st.session_state.translated_lyrics else []
     
-    # 노래방 스타일로 한 줄씩 교차 표시
-    st.subheader("🎤 가사 (노래방 스타일)")
+    # 한 줄씩 원본과 번역을 세로로 표시
+    st.subheader("🎤 가사 (원본 & 번역)")
     
     # 최대 라인 수 계산
     max_lines = max(len(original_lines), len(translated_lines))
     
     for i in range(max_lines):
-        # 원본 가사
+        # 원본 가사 한 줄
         if i < len(original_lines) and original_lines[i]:
             st.markdown(f"**🌍 {original_lines[i]}**")
         
-        # 번역 가사
+        # 번역 가사 한 줄 (바로 아래)
         if i < len(translated_lines) and translated_lines[i]:
             st.markdown(f"**🌐 {translated_lines[i]}**")
         
         # 빈 줄 추가 (가독성 향상)
         if i < max_lines - 1:
             st.markdown("")
+
+# 노래 배경 정보 표시
+if st.session_state.song_background:
+    st.markdown("---")
+    st.header("📚 노래 배경 정보")
+    
+    song_bg = st.session_state.song_background
+    video_info = st.session_state.video_info
+    
+    # Context 정보 표시
+    context = song_bg.get('context', {})
+    has_context = any(context.get(key) for key in context.keys())
+    
+    if has_context:
+        st.markdown("---")
+        st.subheader("📖 상세 배경 정보")
+        
+        # 작곡/작사 의도와 영감
+        if context.get('creation_intent'):
+            with st.expander("💡 작곡/작사 의도와 영감", expanded=True):
+                translated_text, _ = translate_text(context['creation_intent'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 시대적·사회적 맥락
+        if context.get('social_historical'):
+            with st.expander("🌍 시대적·사회적 맥락"):
+                translated_text, _ = translate_text(context['social_historical'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 음악적 특징
+        if context.get('musical_features'):
+            with st.expander("🎼 음악적 특징 (장르, 편곡, 악기, 리듬 등)"):
+                translated_text, _ = translate_text(context['musical_features'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 가사 해석과 상징
+        if context.get('lyrics_meaning'):
+            with st.expander("📝 가사 해석과 상징"):
+                translated_text, _ = translate_text(context['lyrics_meaning'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 아티스트가 담고자 한 메시지
+        if context.get('artist_story'):
+            with st.expander("🎤 아티스트가 담고자 한 메시지"):
+                translated_text, _ = translate_text(context['artist_story'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 대중 반응, 차트 성적, 평가
+        if context.get('public_reception'):
+            with st.expander("📊 대중 반응, 차트 성적, 평가"):
+                translated_text, _ = translate_text(context['public_reception'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 음악계나 사회에 끼친 영향
+        if context.get('influence'):
+            with st.expander("🌟 음악계나 사회에 끼친 영향"):
+                translated_text, _ = translate_text(context['influence'], target_lang_code)
+                st.markdown(translated_text)
+        
+        # 녹음 과정, 뮤직비디오, 공연 에피소드
+        if context.get('behind_the_scenes'):
+            with st.expander("🎬 Behind the Scenes (녹음 과정, 뮤직비디오, 공연 에피소드)"):
+                translated_text, _ = translate_text(context['behind_the_scenes'], target_lang_code)
+                st.markdown(translated_text)
+    
+    # 정보 출처
+    if song_bg.get('sources'):
+        st.markdown("---")
+        st.subheader("📚 참고 출처 (사실 확인된 정보)")
+        for source in song_bg['sources']:
+            st.caption(f"• {source}")
+    
+    # 배경 정보가 없는 경우
+    if not has_context and not song_bg.get('release_year'):
+        st.info("ℹ️ 이 노래에 대한 배경 정보를 찾을 수 없습니다. 더 정확한 정보를 위해 노래 제목과 아티스트 이름을 확인해주세요.")
 
 # 푸터 및 추가 정보
 if not st.session_state.lyrics:
